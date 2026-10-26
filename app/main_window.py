@@ -45,6 +45,10 @@ SAMPLE_COUNTS = [
     20_000, 50_000, 100_000,
 ]
 
+BUTTON_WIDTH = 107
+SELECTOR_WIDTH = BUTTON_WIDTH * 2 + 6
+DEVICE_BUTTON_WIDTH = BUTTON_WIDTH
+
 
 class TimeAxisItem(pg.AxisItem):
     def __init__(self, **kwargs):
@@ -165,14 +169,18 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("STM32 Logic Analyzer")
-        self.resize(1100, 800)
+        self.resize(1320, 800)
 
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
 
-        layout.addLayout(self._make_device_row())
-        layout.addLayout(self._make_capture_row())
+        device_row = self._make_device_row()
+        device_row.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addLayout(device_row)
+        capture_row = self._make_capture_row()
+        capture_row.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addLayout(capture_row)
         layout.addLayout(self._make_action_row())
         layout.addLayout(self._make_test_row())
         layout.addWidget(self._make_marker_row())
@@ -281,6 +289,7 @@ class MainWindow(QMainWindow):
         )
         self.save_button.setEnabled(False)
         self.cursor_button.setEnabled(False)
+        self.markers_button.setEnabled(False)
         self.clear_button.setEnabled(False)
         self._refresh_ports()
 
@@ -305,34 +314,39 @@ class MainWindow(QMainWindow):
 
         self.port_combo = QComboBox()
         self.port_combo.addItem("Select COM port")
-        self.port_combo.setFixedWidth(220)
+        self.port_combo.setFixedWidth(SELECTOR_WIDTH)
 
         self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setFixedWidth(DEVICE_BUTTON_WIDTH)
         self.connect_button = QPushButton("Connect")
+        self.connect_button.setFixedWidth(DEVICE_BUTTON_WIDTH)
 
         row.addWidget(self.port_combo)
-        row.addWidget(self.refresh_button)
-        row.addWidget(self.connect_button)
-        row.addStretch(1)
+        row.addSpacing(12)
+        device_actions = QHBoxLayout()
+        device_actions.setSpacing(6)
+        device_actions.addWidget(self.refresh_button)
+        device_actions.addWidget(self.connect_button)
+        row.addLayout(device_actions)
         return row
 
     def _make_capture_row(self):
         row = QHBoxLayout()
 
         self.frequency_combo = QComboBox()
-        self.frequency_combo.setFixedWidth(180)
+        self.frequency_combo.setFixedWidth(SELECTOR_WIDTH)
         self.frequency_combo.addItem("Select frequency")
         for frequency in FREQUENCIES:
             self.frequency_combo.addItem(f"{frequency:,} Hz", frequency)
 
         self.samples_combo = QComboBox()
-        self.samples_combo.setFixedWidth(210)
+        self.samples_combo.setFixedWidth(SELECTOR_WIDTH)
         self.samples_combo.addItem("Select sample count")
         self._populate_sample_options(SAMPLE_COUNTS)
 
         row.addWidget(self.frequency_combo)
+        row.addSpacing(12)
         row.addWidget(self.samples_combo)
-        row.addStretch(1)
         return row
 
     def _make_action_row(self):
@@ -349,31 +363,52 @@ class MainWindow(QMainWindow):
         self.zoom_out_button = QPushButton("Zoom -")
         self.fit_button = QPushButton("Fit")
         self.clear_button = QPushButton("Clear")
+        self._set_waveform_navigation_enabled(False)
 
         self.save_button = QPushButton("Save")
         self.open_button = QPushButton("Open")
         self.info_button = QPushButton("Information")
 
-        row.addWidget(self.start_button)
-        row.addWidget(self.stop_button)
-        row.addSpacing(12)
-        row.addWidget(self.zoom_in_button)
-        row.addWidget(self.zoom_out_button)
-        row.addSpacing(12)
-        row.addWidget(self.fit_button)
-        row.addWidget(self.clear_button)
-        row.addSpacing(12)
-        row.addWidget(self.cursor_button)
-        row.addWidget(self.markers_button)
+        for button in (
+            self.start_button,
+            self.stop_button,
+            self.zoom_in_button,
+            self.zoom_out_button,
+            self.fit_button,
+            self.clear_button,
+            self.cursor_button,
+            self.markers_button,
+            self.save_button,
+            self.open_button,
+            self.info_button,
+        ):
+            button.setFixedWidth(BUTTON_WIDTH)
+
+        for left_button, right_button in (
+            (self.start_button, self.stop_button),
+            (self.zoom_in_button, self.zoom_out_button),
+            (self.fit_button, self.clear_button),
+            (self.cursor_button, self.markers_button),
+        ):
+            button_pair = QHBoxLayout()
+            button_pair.setSpacing(6)
+            button_pair.addWidget(left_button)
+            button_pair.addWidget(right_button)
+            row.addLayout(button_pair)
+            row.addSpacing(12)
+
         row.addStretch(1)
         row.addWidget(self.save_button)
+        row.addSpacing(6)
         row.addWidget(self.open_button)
+        row.addSpacing(6)
         row.addWidget(self.info_button)
         return row
 
     def _make_test_row(self):
         row = QHBoxLayout()
         self.demo_button = QPushButton("Test waveform")
+        self.demo_button.setFixedWidth(BUTTON_WIDTH)
         row.addWidget(self.demo_button)
         row.addStretch(1)
         return row
@@ -778,6 +813,7 @@ class MainWindow(QMainWindow):
         self._capture_frequency_hz = None
         self._capture_metadata_available = False
         self._marker_edges_cache_key = None
+        self._set_waveform_navigation_enabled(False)
         self.save_button.setEnabled(False)
         self.clear_button.setEnabled(False)
         self.cursor_button.setEnabled(False)
@@ -825,6 +861,7 @@ class MainWindow(QMainWindow):
             return
 
         self._capture_samples.extend(packet.payload)
+        self._set_waveform_navigation_enabled(True)
         progress = received * 100 // target_samples
         self.progress.setValue(progress)
 
@@ -1036,6 +1073,7 @@ class MainWindow(QMainWindow):
         self._capture_samples = bytearray(capture.samples)
         self._capture_frequency_hz = capture.frequency_hz
         self._marker_edges_cache_key = None
+        self._set_waveform_navigation_enabled(bool(self._capture_samples))
         if capture.channel_layout is not None:
             self._apply_channel_layout(capture.channel_layout)
         self.time_axis.set_frequency(capture.frequency_hz)
@@ -1162,6 +1200,7 @@ class MainWindow(QMainWindow):
         self._capture_frequency_hz = None
         self._capture_metadata_available = False
         self._marker_edges_cache_key = None
+        self._set_waveform_navigation_enabled(True)
         self.time_axis.set_frequency(None)
         self.save_button.setEnabled(False)
         self.clear_button.setEnabled(True)
@@ -1179,6 +1218,11 @@ class MainWindow(QMainWindow):
         self.logic_plot.setXRange(0, len(samples), padding=0)
         self.status_label.setText("Demo waveform (simulated data)")
         self.progress.setValue(100)
+
+    def _set_waveform_navigation_enabled(self, enabled: bool):
+        self.zoom_in_button.setEnabled(enabled)
+        self.zoom_out_button.setEnabled(enabled)
+        self.fit_button.setEnabled(enabled)
 
     def _zoom_x(self, factor: float):
         if not self._capture_samples:
@@ -1401,6 +1445,7 @@ class MainWindow(QMainWindow):
         self._capture_frequency_hz = None
         self._capture_metadata_available = False
         self._marker_edges_cache_key = None
+        self._set_waveform_navigation_enabled(False)
         self._clear_waveform()
         self.time_axis.set_frequency(None)
         self.cursor_line.setVisible(False)

@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from app.capture_file import load_capture, save_capture
-from app.main_window import MainWindow
+from app.main_window import BUTTON_WIDTH, MainWindow, SELECTOR_WIDTH
 
 
 class MainWindowUiTests(unittest.TestCase):
@@ -25,9 +25,105 @@ class MainWindowUiTests(unittest.TestCase):
         self.window.close()
 
     def test_device_and_capture_selectors_have_compact_widths(self):
-        self.assertEqual(self.window.port_combo.width(), 220)
-        self.assertEqual(self.window.frequency_combo.width(), 180)
-        self.assertEqual(self.window.samples_combo.width(), 210)
+        selector_width = self.window.port_combo.width()
+        self.assertEqual(selector_width, SELECTOR_WIDTH)
+        self.assertEqual(self.window.frequency_combo.width(), selector_width)
+        self.assertEqual(self.window.samples_combo.width(), selector_width)
+        self.assertEqual(
+            self.window.refresh_button.width()
+            + self.window.connect_button.width()
+            + 6,
+            selector_width,
+        )
+        for left_button, right_button in (
+            (self.window.start_button, self.window.stop_button),
+            (self.window.zoom_in_button, self.window.zoom_out_button),
+            (self.window.fit_button, self.window.clear_button),
+            (self.window.cursor_button, self.window.markers_button),
+        ):
+            self.assertEqual(
+                left_button.width() + right_button.width() + 6,
+                selector_width,
+            )
+
+    def test_all_action_buttons_have_equal_width(self):
+        buttons = (
+            self.window.refresh_button,
+            self.window.connect_button,
+            self.window.start_button,
+            self.window.stop_button,
+            self.window.zoom_in_button,
+            self.window.zoom_out_button,
+            self.window.fit_button,
+            self.window.clear_button,
+            self.window.cursor_button,
+            self.window.markers_button,
+            self.window.demo_button,
+            self.window.save_button,
+            self.window.open_button,
+            self.window.info_button,
+        )
+        self.assertTrue(all(button.width() == BUTTON_WIDTH for button in buttons))
+
+    def test_device_actions_and_sample_selector_stay_next_to_their_selectors(self):
+        self.window.show()
+        self.app.processEvents()
+
+        central_widget = self.window.centralWidget()
+        device_gap = (
+            self.window.refresh_button.mapTo(central_widget, self.window.refresh_button.rect().topLeft()).x()
+            - self.window.port_combo.mapTo(central_widget, self.window.port_combo.rect().topRight()).x()
+        )
+        frequency_gap = (
+            self.window.samples_combo.mapTo(central_widget, self.window.samples_combo.rect().topLeft()).x()
+            - self.window.frequency_combo.mapTo(central_widget, self.window.frequency_combo.rect().topRight()).x()
+        )
+        zoom_pair_gap = (
+            self.window.zoom_in_button.mapTo(central_widget, self.window.zoom_in_button.rect().topLeft()).x()
+            - self.window.stop_button.mapTo(central_widget, self.window.stop_button.rect().topRight()).x()
+        )
+        self.assertEqual(device_gap, zoom_pair_gap)
+        self.assertEqual(frequency_gap, zoom_pair_gap)
+
+        self.assertGreaterEqual(
+            self.window.refresh_button.x(),
+            self.window.port_combo.x() + self.window.port_combo.width(),
+        )
+        self.assertLess(
+            self.window.refresh_button.x(),
+            self.window.port_combo.x() + self.window.port_combo.width() + 20,
+        )
+        self.assertGreaterEqual(
+            self.window.samples_combo.x(),
+            self.window.frequency_combo.x() + self.window.frequency_combo.width(),
+        )
+        self.assertLess(
+            self.window.samples_combo.x(),
+            self.window.frequency_combo.x()
+            + self.window.frequency_combo.width()
+            + 20,
+        )
+
+    def test_markers_button_is_disabled_until_waveform_data_exists(self):
+        self.assertFalse(self.window.cursor_button.isEnabled())
+        self.assertFalse(self.window.markers_button.isEnabled())
+        self.assertFalse(self.window.zoom_in_button.isEnabled())
+        self.assertFalse(self.window.zoom_out_button.isEnabled())
+        self.assertFalse(self.window.fit_button.isEnabled())
+
+        self.window._show_demo_waveform()
+        self.assertTrue(self.window.cursor_button.isEnabled())
+        self.assertTrue(self.window.markers_button.isEnabled())
+        self.assertTrue(self.window.zoom_in_button.isEnabled())
+        self.assertTrue(self.window.zoom_out_button.isEnabled())
+        self.assertTrue(self.window.fit_button.isEnabled())
+
+        self.window._clear_dashboard()
+        self.assertFalse(self.window.cursor_button.isEnabled())
+        self.assertFalse(self.window.markers_button.isEnabled())
+        self.assertFalse(self.window.zoom_in_button.isEnabled())
+        self.assertFalse(self.window.zoom_out_button.isEnabled())
+        self.assertFalse(self.window.fit_button.isEnabled())
 
     def test_measurement_readouts_are_shown_only_when_enabled(self):
         self.assertTrue(self.window.measurement_controls.isHidden())
