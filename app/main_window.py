@@ -57,7 +57,10 @@ class TimeAxisItem(pg.AxisItem):
 
     def set_frequency(self, frequency_hz: int | None) -> None:
         self.frequency_hz = frequency_hz
-        self.setLabel("bottom", "Time" if frequency_hz else "Sample index")
+        if frequency_hz is None:
+            self.setLabel("Sample index")
+        else:
+            self.setLabel("Time")
         self.picture = None
         self.update()
 
@@ -259,6 +262,8 @@ class MainWindow(QMainWindow):
         )
         self.start_button.setEnabled(False)
         self.start_button.clicked.connect(self._start_capture)
+        self.stop_button.clicked.connect(self._stop_capture)
+        self.stop_button.setEnabled(False)
         self.save_button.clicked.connect(self._save_capture)
         self.open_button.clicked.connect(self._open_capture)
         self.info_button.clicked.connect(self._show_information)
@@ -696,6 +701,7 @@ class MainWindow(QMainWindow):
     def _on_disconnected(self):
         self._is_connected = False
         self._capture_active = False
+        self.stop_button.setEnabled(False)
         self._plot_timer.stop()
         self._config_timeout_timer.stop()
         self._pending_config = None
@@ -759,6 +765,7 @@ class MainWindow(QMainWindow):
             self.samples_combo.setEnabled(False)
             self.connect_button.setEnabled(False)
             self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
             self.progress.setValue(0)
             self.status_label.setText("Capturing: 0 samples received")
             self._plot_timer.start()
@@ -773,6 +780,10 @@ class MainWindow(QMainWindow):
 
         if packet.packet_type == PacketType.CAPTURE_DONE:
             self._handle_capture_done(packet)
+            return
+
+        if packet.packet_type == PacketType.CAPTURE_STOPPED:
+            self._handle_capture_stopped(packet)
             return
 
         if packet.packet_type == PacketType.ERROR:
@@ -830,7 +841,20 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.status_label.setText("Starting capture...")
         self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
         self.device_worker.start_capture()
+
+    def _stop_capture(self):
+        if (
+            not self._is_connected
+            or self.device_worker is None
+            or not self._capture_active
+        ):
+            return
+
+        self.status_label.setText("Stopping capture...")
+        self.stop_button.setEnabled(False)
+        self.device_worker.stop_capture()
 
     def _handle_data_packet(self, packet: Packet):
         if not self._capture_active or self._desired_config is None:
@@ -866,7 +890,7 @@ class MainWindow(QMainWindow):
         self.progress.setValue(progress)
 
     def _handle_capture_done(self, packet: Packet):
-        if not self._capture_active or self._desired_config is None:
+        if self._desired_config is None:
             self.status_label.setText("Unexpected CAPTURE_DONE packet")
             return
 
@@ -875,15 +899,26 @@ class MainWindow(QMainWindow):
         _, target_samples = self._desired_config
 
         self._capture_active = False
+        self.stop_button.setEnabled(False)
         self._plot_timer.stop()
         self._set_capture_controls_enabled(True)
         self._refresh_capture_plot(show_all=True)
 
-        if (
-            reported_samples != received_samples
-            or received_samples != target_samples
-        ):
-            self.start_button.setEnabled(False)
+        valid_partial_capture = (
+            0 < reported_samples <= target_samples
+            and received_samples == reported_samples
+        )
+
+        if not valid_partial_capture:
+            self.start_button.setEnabled(
+                self._is_connected
+                and self._desired_config is not None
+                and self._configured_config == self._desired_config
+            )
+            self.clear_button.setEnabled(bool(self._capture_samples))
+            self.cursor_button.setEnabled(bool(self._capture_samples))
+            self.markers_button.setEnabled(bool(self._capture_samples))
+            self.save_button.setEnabled(bool(self._capture_samples))
             self.status_label.setText(
                 "Capture count mismatch: "
                 f"received {received_samples:,}/{target_samples:,}, "
@@ -891,7 +926,68 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.progress.setValue(100)
+        percent = int((received_samples * 100) / max(target_samples, 1))
+        self.progress.setValue(percent)
+        self._capture_frequency_hz = self._desired_config[0]
+        self.time_axis.set_frequency(self._capture_frequency_hz)
+        self._capture_metadata_available = True
+        self.save_button.setEnabled(True)
+        self.clear_button.setEnabled(True)
+        self.cursor_button.setEnabled(bool(self._capture_samples))
+        self.markers_button.setEnabled(bool(self._capture_samples))
+        if received_samples < target_samples:
+            self.status_label.setText(
+                f"Stopped early: {received_samples:,}/{target_samples:,} samples saved"
+            )
+        else:
+            self.status_label.setText(
+                f"Complete: {received_samples:,} samples received"
+            )
+        self.start_button.setEnabled(
+            self._is_connected
+            and self._desired_config is not None
+            and self._configured_config == self._desired_config
+        )
+
+    def _handle_capture_stopped(self, packet: Packet):
+        if self._desired_config is None:
+            self.status_label.setText("Unexpected CAPTURE_STOPPED packet")
+            return
+
+        reported_samples = int.from_bytes(packet.payload, byteorder="little")
+        received_samples = len(self._capture_samples)
+        _, target_samples = self._desired_config
+
+        self._capture_active = False
+        self.stop_button.setEnabled(False)
+        self._plot_timer.stop()
+        self._set_capture_controls_enabled(True)
+        self._refresh_capture_plot(show_all=True)
+
+        valid_partial_capture = (
+            0 < reported_samples <= target_samples
+            and received_samples == reported_samples
+        )
+
+        if not valid_partial_capture:
+            self.status_label.setText(
+                "Stopped capture but sample count is inconsistent: "
+                f"received {received_samples:,}/{target_samples:,}, "
+                f"device reported {reported_samples:,}"
+            )
+            self.start_button.setEnabled(
+                self._is_connected
+                and self._desired_config is not None
+                and self._configured_config == self._desired_config
+            )
+            self.clear_button.setEnabled(bool(self._capture_samples))
+            self.cursor_button.setEnabled(bool(self._capture_samples))
+            self.markers_button.setEnabled(bool(self._capture_samples))
+            self.save_button.setEnabled(bool(self._capture_samples))
+            return
+
+        percent = int((received_samples * 100) / max(target_samples, 1))
+        self.progress.setValue(percent)
         self._capture_frequency_hz = self._desired_config[0]
         self.time_axis.set_frequency(self._capture_frequency_hz)
         self._capture_metadata_available = True
@@ -900,15 +996,17 @@ class MainWindow(QMainWindow):
         self.cursor_button.setEnabled(bool(self._capture_samples))
         self.markers_button.setEnabled(bool(self._capture_samples))
         self.status_label.setText(
-            f"Complete: {received_samples:,} samples received"
+            f"Stopped early: {received_samples:,}/{target_samples:,} samples saved"
         )
         self.start_button.setEnabled(
             self._is_connected
+            and self._desired_config is not None
             and self._configured_config == self._desired_config
         )
 
     def _fail_capture(self, message: str):
         self._capture_active = False
+        self.stop_button.setEnabled(False)
         self._plot_timer.stop()
         self._set_capture_controls_enabled(True)
         self.start_button.setEnabled(False)
@@ -924,6 +1022,13 @@ class MainWindow(QMainWindow):
         self.samples_combo.setEnabled(enabled)
         self.connect_button.setEnabled(enabled and self._is_connected)
         self.open_button.setEnabled(enabled)
+        self.start_button.setEnabled(
+            enabled
+            and self._is_connected
+            and self._desired_config is not None
+            and self._configured_config == self._desired_config
+            and not self._capture_active
+        )
 
     def _refresh_capture_plot(self, show_all: bool = False):
         if not self._capture_samples:

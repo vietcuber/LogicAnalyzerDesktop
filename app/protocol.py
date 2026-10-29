@@ -10,12 +10,13 @@ MAX_DATA_PAYLOAD = 1024
 
 
 class PacketType(IntEnum):
-    STREAM_DATA = 0x01
-    SNAPSHOT_DATA = 0x02
-    CONFIG_OK = 0x10
+    STREAM_DATA     = 0x01
+    SNAPSHOT_DATA   = 0x02
+    CONFIG_OK       = 0x10
     CAPTURE_STARTED = 0x11
-    CAPTURE_DONE = 0x12
-    ERROR = 0x7F
+    CAPTURE_DONE    = 0x12
+    CAPTURE_STOPPED = 0x13
+    ERROR           = 0x7F
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ class PacketParser:
             PacketType.CONFIG_OK: 0,
             PacketType.CAPTURE_STARTED: 0,
             PacketType.CAPTURE_DONE: 4,
+            PacketType.CAPTURE_STOPPED: 4,
             PacketType.ERROR: 1,
         }
         return length == expected_lengths[packet_type]

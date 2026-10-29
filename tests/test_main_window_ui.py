@@ -150,6 +150,41 @@ class MainWindowUiTests(unittest.TestCase):
         self.window.markers_button.setChecked(False)
         self.assertTrue(self.window.measurement_controls.isHidden())
 
+    def test_stop_reenables_capture_actions_after_stopping(self):
+        self.window._is_connected = True
+        self.window._capture_active = True
+        self.window._desired_config = (100_000, 3)
+        self.window._configured_config = (100_000, 3)
+        self.window._capture_samples = bytearray([0x00, 0xFF, 0x55])
+        self.window.progress.setValue(0)
+        self.window._capture_metadata_available = True
+        self.window.start_button.setEnabled(False)
+        self.window.stop_button.setEnabled(True)
+        self.window.clear_button.setEnabled(False)
+        self.window.cursor_button.setEnabled(False)
+        self.window.markers_button.setEnabled(False)
+        self.window.save_button.setEnabled(False)
+        self.window.device_worker = type(
+            "DummyWorker",
+            (),
+            {
+                "stop_capture": lambda _self: None,
+                "request_stop": lambda _self: None,
+                "wait": lambda _self, *_args, **_kwargs: None,
+            },
+        )()
+
+        self.window._stop_capture()
+        self.window._handle_capture_done(type("Packet", (), {"payload": (3).to_bytes(4, "little")})())
+
+        self.assertFalse(self.window.stop_button.isEnabled())
+        self.assertTrue(self.window.start_button.isEnabled())
+        self.assertTrue(self.window.clear_button.isEnabled())
+        self.assertTrue(self.window.cursor_button.isEnabled())
+        self.assertTrue(self.window.markers_button.isEnabled())
+        self.assertTrue(self.window.save_button.isEnabled())
+        self.assertEqual(self.window.progress.value(), 100)
+
     def test_information_button_opens_about_popup_with_developer_contact(self):
         with patch("app.main_window.QMessageBox.about") as show_about:
             self.window.info_button.click()

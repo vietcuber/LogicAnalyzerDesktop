@@ -26,6 +26,9 @@ class DeviceWorker(QThread):
     def start_capture(self) -> None:
         self._commands.put(b"START")
 
+    def stop_capture(self) -> None:
+        self._commands.put(b"STOP")
+
     def request_stop(self) -> None:
         self._stop_requested.set()
 
