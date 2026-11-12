@@ -107,7 +107,7 @@ class PacketParser:
             PacketType.CAPTURE_STOPPED: 4,
             PacketType.TRIGGER_OK: 0,
             PacketType.TRIGGER_ARMED: 0,
-            PacketType.TRIGGER_FIRED: 0,
+            PacketType.TRIGGER_FIRED: 4,
             PacketType.TRIGGER_TIMEOUT: 0,
             PacketType.ERROR: 1,
         }

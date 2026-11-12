@@ -221,8 +221,9 @@ class MainWindow(QMainWindow):
         self._capture_frequency_hz: int | None = None
         self._trigger_config_ready = False
         self._trigger_config_pending = False
-        self._pending_trigger: tuple[int, TriggerMode] | None = None
-        self._applied_trigger: tuple[int, TriggerMode] | None = None
+        self._pending_trigger: tuple[int, TriggerMode, int, int] | None = None
+        self._applied_trigger: tuple[int, TriggerMode, int, int] | None = None
+        self._trigger_sample_index: int | None = None
         self._sync_trigger_on_connect = False
         self._capture_metadata_available = False
         self._plot_window_samples = 4096
@@ -278,6 +279,12 @@ class MainWindow(QMainWindow):
             self._on_trigger_selection_changed
         )
         self.trigger_mode_combo.currentIndexChanged.connect(
+            self._on_trigger_selection_changed
+        )
+        self.trigger_pre_combo.currentIndexChanged.connect(
+            self._on_trigger_selection_changed
+        )
+        self.trigger_timeout_combo.currentIndexChanged.connect(
             self._on_trigger_selection_changed
         )
         self.apply_trigger_button.clicked.connect(self._apply_trigger_config)
@@ -390,12 +397,33 @@ class MainWindow(QMainWindow):
         self.trigger_mode_combo.addItem("Trigger: EITHER", TriggerMode.EITHER)
         self.trigger_mode_combo.setCurrentIndex(0)
 
+        self.trigger_pre_combo = QComboBox()
+        self.trigger_pre_combo.setFixedWidth(SELECTOR_WIDTH)
+        self.trigger_pre_combo.setToolTip(
+            "Pre-trigger buffer % (Streaming mode capped at 5,120 samples)"
+        )
+        for pct in (0, 10, 20, 50, 80):
+            self.trigger_pre_combo.addItem(f"Pre: {pct}%", pct)
+        self.trigger_pre_combo.setCurrentIndex(0)
+
+        self.trigger_timeout_combo = QComboBox()
+        self.trigger_timeout_combo.setFixedWidth(SELECTOR_WIDTH)
+        self.trigger_timeout_combo.addItem("Timeout: Infinite", 0)
+        self.trigger_timeout_combo.addItem("Timeout: 2s", 2000)
+        self.trigger_timeout_combo.addItem("Timeout: 5s", 5000)
+        self.trigger_timeout_combo.addItem("Timeout: 10s", 10000)
+        self.trigger_timeout_combo.setCurrentIndex(0)
+
         self.apply_trigger_button = QPushButton("Apply trigger")
         self.apply_trigger_button.setFixedWidth(BUTTON_WIDTH)
 
         row.addWidget(self.trigger_channel_combo)
         row.addSpacing(12)
         row.addWidget(self.trigger_mode_combo)
+        row.addSpacing(12)
+        row.addWidget(self.trigger_pre_combo)
+        row.addSpacing(12)
+        row.addWidget(self.trigger_timeout_combo)
         row.addSpacing(12)
         row.addWidget(self.apply_trigger_button)
         return row
@@ -745,10 +773,15 @@ class MainWindow(QMainWindow):
         self.samples_combo.setEnabled(True)
         self.trigger_channel_combo.setEnabled(True)
         self.trigger_mode_combo.setEnabled(True)
+        self.trigger_pre_combo.setEnabled(True)
+        self.trigger_timeout_combo.setEnabled(True)
         self.connect_button.setText("Disconnect")
         self.connect_button.setEnabled(True)
         self.apply_trigger_button.setEnabled(True)
         self.status_label.setText(f"Connected to {port_name}")
+        if self.device_worker is not None:
+            # Clear any stale ARMED/CAPTURING state left from an abrupt disconnect.
+            self.device_worker.stop_capture()
         if self._desired_config is not None:
             # Sync trigger after initial CONFIG_OK so commands never collide on USB CDC.
             self._sync_trigger_on_connect = True
@@ -790,6 +823,8 @@ class MainWindow(QMainWindow):
         self.samples_combo.setEnabled(True)
         self.trigger_channel_combo.setEnabled(True)
         self.trigger_mode_combo.setEnabled(True)
+        self.trigger_pre_combo.setEnabled(True)
+        self.trigger_timeout_combo.setEnabled(True)
         self.open_button.setEnabled(True)
         self.start_button.setEnabled(False)
         self.apply_trigger_button.setEnabled(False)
@@ -888,12 +923,16 @@ class MainWindow(QMainWindow):
                 ):
                     self.start_button.setEnabled(self._is_connected)
                 if self._applied_trigger is not None:
-                    ch, mode = self._applied_trigger
+                    ch, mode, pre_pct, timeout_ms = self._applied_trigger
                     if mode == TriggerMode.NONE:
                         self.status_label.setText("Trigger disabled (NONE)")
                     else:
+                        timeout_label = (
+                            "Infinite" if timeout_ms == 0 else f"{timeout_ms / 1000:g}s"
+                        )
                         self.status_label.setText(
-                            f"Trigger active: CH{ch} {mode.name.title()}"
+                            f"Trigger active: CH{ch} {mode.name.title()} "
+                            f"(Pre {pre_pct}%, Timeout {timeout_label})"
                         )
                 else:
                     self.status_label.setText(trigger_status[packet.packet_type])
@@ -907,7 +946,17 @@ class MainWindow(QMainWindow):
                 return
             if packet.packet_type == PacketType.TRIGGER_FIRED:
                 self._start_timeout_timer.stop()
-                self._begin_active_capture(trigger_status[packet.packet_type])
+                trig_idx = (
+                    int.from_bytes(packet.payload, byteorder="little")
+                    if len(packet.payload) == 4
+                    else 0
+                )
+                self._trigger_sample_index = trig_idx
+                self.trigger_line.setPos(trig_idx)
+                self.trigger_line.setVisible(True)
+                self._begin_active_capture(
+                    f"Trigger fired at sample {trig_idx:,}"
+                )
                 return
 
             self._start_timeout_timer.stop()
@@ -948,44 +997,64 @@ class MainWindow(QMainWindow):
                 f"{error_names.get(error_code, 'Unknown error')}"
             )
 
-    def set_trigger_mode(self, channel: int, mode: TriggerMode) -> None:
+    def set_trigger_mode(
+        self,
+        channel: int,
+        mode: TriggerMode,
+        pre_trigger_pct: int = 0,
+        timeout_ms: int = 0,
+    ) -> None:
         if self.device_worker is None:
             return
         if isinstance(mode, int) and not isinstance(mode, TriggerMode):
             mode = TriggerMode(mode)
-        self.device_worker.trigger(channel, mode)
+        self.device_worker.trigger(channel, mode, pre_trigger_pct, timeout_ms)
+
+    def _current_trigger_selection(self) -> tuple[int, TriggerMode, int, int] | None:
+        channel = self.trigger_channel_combo.currentData()
+        mode = self.trigger_mode_combo.currentData()
+        pre_pct = self.trigger_pre_combo.currentData()
+        timeout_ms = self.trigger_timeout_combo.currentData()
+        if channel is None or mode is None or pre_pct is None or timeout_ms is None:
+            return None
+        return (int(channel), TriggerMode(mode), int(pre_pct), int(timeout_ms))
 
     def _on_trigger_selection_changed(self, _index=None):
         if not self._is_connected or self._capture_active or self._trigger_armed:
             return
-        channel = self.trigger_channel_combo.currentData()
-        mode = self.trigger_mode_combo.currentData()
-        if channel is None or mode is None:
+        selection = self._current_trigger_selection()
+        if selection is None:
             return
-        selection = (int(channel), TriggerMode(mode))
         if self._applied_trigger is not None and selection != self._applied_trigger:
             self.status_label.setText(
                 "Trigger selection changed - click 'Apply trigger' to update device"
             )
 
-    def _send_trigger_selection(self, channel: int, mode: TriggerMode, status_prefix: str = "Trigger set"):
+    def _send_trigger_selection(
+        self,
+        channel: int,
+        mode: TriggerMode,
+        pre_pct: int = 0,
+        timeout_ms: int = 0,
+        status_prefix: str = "Trigger set",
+    ):
         self._trigger_config_pending = True
         self._trigger_config_ready = False
-        self._pending_trigger = (channel, mode)
+        self._pending_trigger = (channel, mode, pre_pct, timeout_ms)
         self.start_button.setEnabled(False)
-        self.set_trigger_mode(channel, mode)
+        self.set_trigger_mode(channel, mode, pre_pct, timeout_ms)
         self.status_label.setText(
-            f"{status_prefix}: CH{channel} {mode.name.title()} (waiting for ack...)"
+            f"{status_prefix}: CH{channel} {mode.name.title()} "
+            f"(Pre {pre_pct}%, waiting for ack...)"
         )
 
     def _sync_ui_trigger_to_device(self):
         if self.device_worker is None or not self._is_connected:
             return
-        channel = self.trigger_channel_combo.currentData()
-        mode = self.trigger_mode_combo.currentData()
-        if channel is None or mode is None:
+        selection = self._current_trigger_selection()
+        if selection is None:
             return
-        self._send_trigger_selection(int(channel), TriggerMode(mode), "Syncing trigger")
+        self._send_trigger_selection(*selection, status_prefix="Syncing trigger")
 
     def _apply_trigger_config(self):
         if self.device_worker is None or not self._is_connected:
@@ -996,13 +1065,12 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Stop the current capture before changing trigger settings")
             return
 
-        channel = self.trigger_channel_combo.currentData()
-        mode = self.trigger_mode_combo.currentData()
-        if channel is None or mode is None:
-            self.status_label.setText("Select both trigger channel and trigger mode")
+        selection = self._current_trigger_selection()
+        if selection is None:
+            self.status_label.setText("Select trigger channel and mode")
             return
 
-        self._send_trigger_selection(int(channel), TriggerMode(mode))
+        self._send_trigger_selection(*selection)
 
     def _begin_active_capture(self, status_text: str):
         if self._desired_config is None:
@@ -1041,6 +1109,8 @@ class MainWindow(QMainWindow):
         self._capture_samples.clear()
         self._capture_frequency_hz = None
         self._capture_metadata_available = False
+        self._trigger_sample_index = None
+        self.trigger_line.setVisible(False)
         self._marker_edges_cache_key = None
         self._set_waveform_navigation_enabled(False)
         self.save_button.setEnabled(False)
@@ -1116,6 +1186,9 @@ class MainWindow(QMainWindow):
         self._finish_capture(packet, is_stopped=True)
 
     def _finish_capture(self, packet: Packet, is_stopped: bool):
+        if is_stopped and not self._capture_active and not self._trigger_armed:
+            return
+
         if self._desired_config is None:
             packet_name = "CAPTURE_STOPPED" if is_stopped else "CAPTURE_DONE"
             self.status_label.setText(f"Unexpected {packet_name} packet")
@@ -1182,6 +1255,13 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(
                     f"Stopped early: {received_samples:,}/{target_samples:,} samples saved"
                 )
+            elif self._trigger_sample_index is not None:
+                self.trigger_line.setPos(self._trigger_sample_index)
+                self.trigger_line.setVisible(True)
+                self.status_label.setText(
+                    f"Complete: {received_samples:,} samples received "
+                    f"(Trigger @ {self._trigger_sample_index:,})"
+                )
             else:
                 self.status_label.setText(
                     f"Complete: {received_samples:,} samples received"
@@ -1212,6 +1292,8 @@ class MainWindow(QMainWindow):
         self.samples_combo.setEnabled(enabled)
         self.trigger_channel_combo.setEnabled(enabled)
         self.trigger_mode_combo.setEnabled(enabled)
+        self.trigger_pre_combo.setEnabled(enabled)
+        self.trigger_timeout_combo.setEnabled(enabled)
         self.connect_button.setEnabled(enabled and self._is_connected)
         self.apply_trigger_button.setEnabled(enabled and self._is_connected and not busy)
         self.open_button.setEnabled(enabled)
@@ -1371,6 +1453,8 @@ class MainWindow(QMainWindow):
 
         self._capture_samples = bytearray(capture.samples)
         self._capture_frequency_hz = capture.frequency_hz
+        self._trigger_sample_index = None
+        self.trigger_line.setVisible(False)
         self._marker_edges_cache_key = None
         self._set_waveform_navigation_enabled(bool(self._capture_samples))
         if capture.channel_layout is not None:
@@ -1470,10 +1554,20 @@ class MainWindow(QMainWindow):
             label="B",
             labelOpts={"position": 0.9, "color": "#FF5252"},
         )
+        self.trigger_line = pg.InfiniteLine(
+            pos=0,
+            angle=90,
+            movable=False,
+            pen=pg.mkPen("#FFB300", width=1.5, style=Qt.PenStyle.DashDotLine),
+            label="T",
+            labelOpts={"position": 0.95, "color": "#FFB300"},
+        )
         self.marker_a_line.setVisible(False)
         self.marker_b_line.setVisible(False)
+        self.trigger_line.setVisible(False)
         self.logic_plot.addItem(self.marker_a_line)
         self.logic_plot.addItem(self.marker_b_line)
+        self.logic_plot.addItem(self.trigger_line)
 
         self.plot_area.ci.layout.setContentsMargins(8, 8, 8, 8)
 
@@ -1748,8 +1842,10 @@ class MainWindow(QMainWindow):
         self._clear_waveform()
         self.time_axis.set_frequency(None)
         self.cursor_line.setVisible(False)
+        self._trigger_sample_index = None
         self.marker_a_line.setVisible(False)
         self.marker_b_line.setVisible(False)
+        self.trigger_line.setVisible(False)
         self.cursor_button.setChecked(False)
         self.markers_button.setChecked(False)
         self.marker_channel_combo.setEnabled(False)

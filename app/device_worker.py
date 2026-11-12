@@ -29,9 +29,16 @@ class DeviceWorker(QThread):
     def stop_capture(self) -> None:
         self._commands.put(b"STOP")
 
-    def trigger(self, channel: int, mode: TriggerMode) -> None:
+    def trigger(
+        self,
+        channel: int,
+        mode: TriggerMode,
+        pre_trigger_pct: int = 0,
+        timeout_ms: int = 0,
+    ) -> None:
         mode_name = mode.name.upper()
-        self._commands.put(f"TRIGGER {channel} {mode_name}".encode("ascii"))
+        command = f"TRIGGER {channel} {mode_name} {pre_trigger_pct} {timeout_ms}".encode("ascii")
+        self._commands.put(command)
 
     def request_stop(self) -> None:
         self._stop_requested.set()
@@ -72,3 +79,6 @@ class DeviceWorker(QThread):
                 raise serial.SerialTimeoutException(
                     f"Không gửi đủ lệnh: {written}/{len(command)} byte"
                 )
+            port.flush()
+            if not self._commands.empty():
+                self.msleep(5)

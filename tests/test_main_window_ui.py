@@ -252,7 +252,7 @@ class MainWindowUiTests(unittest.TestCase):
                 "sent": [],
                 "start_capture": lambda _self: _self.sent.append("START"),
                 "stop_capture": lambda _self: _self.sent.append("STOP"),
-                "trigger": lambda _self, ch, mode: _self.sent.append(f"TRIGGER {ch} {mode}"),
+                "trigger": lambda _self, ch, mode, pre=0, timeout=0: _self.sent.append(f"TRIGGER {ch} {mode} {pre} {timeout}"),
                 "configure": lambda _self, f, s: _self.sent.append(f"CONFIGURE {f} {s}"),
                 "request_stop": lambda _self: None,
                 "wait": lambda _self, *_args, **_kwargs: None,
@@ -274,10 +274,14 @@ class MainWindowUiTests(unittest.TestCase):
         self.assertTrue(self.window.stop_button.isEnabled())
         self.assertFalse(self.window.frequency_combo.isEnabled())
 
-        self.window._on_packet_received(Packet(PacketType.TRIGGER_FIRED, 3, b""))
+        self.window._on_packet_received(
+            Packet(PacketType.TRIGGER_FIRED, 3, (250).to_bytes(4, "little"))
+        )
         self.assertFalse(self.window._trigger_armed)
         self.assertTrue(self.window._capture_active)
         self.assertTrue(self.window._plot_timer.isActive())
+        self.assertEqual(self.window._trigger_sample_index, 250)
+        self.assertTrue(self.window.trigger_line.isVisible())
 
         self.window._on_packet_received(Packet(PacketType.STREAM_DATA, 4, bytes([0x55] * 1000)))
         self.assertEqual(len(self.window._capture_samples), 1000)
@@ -286,7 +290,10 @@ class MainWindowUiTests(unittest.TestCase):
             Packet(PacketType.CAPTURE_DONE, 5, (1000).to_bytes(4, "little"))
         )
         self.assertFalse(self.window._capture_active)
-        self.assertEqual(self.window.status_label.text(), "Complete: 1,000 samples received")
+        self.assertEqual(
+            self.window.status_label.text(),
+            "Complete: 1,000 samples received (Trigger @ 250)",
+        )
         self.assertTrue(self.window.save_button.isEnabled())
         self.assertTrue(self.window.apply_trigger_button.isEnabled())
 
@@ -348,14 +355,23 @@ class MainWindowUiTests(unittest.TestCase):
         self.window.samples_combo.setCurrentIndex(s_idx)
 
         self.window._on_connected("COM4")
-        self.assertEqual(worker.sent, ["CONFIGURE 100000 1000"])
+        self.assertEqual(worker.sent, ["STOP", "CONFIGURE 100000 1000"])
         self.assertFalse(self.window.start_button.isEnabled())
+
+        # Stale STOP reply from connect cleanup should be ignored cleanly.
+        self.window._on_packet_received(
+            Packet(PacketType.CAPTURE_STOPPED, 0, (0).to_bytes(4, "little"))
+        )
 
         # CONFIG_OK triggers automatic UI trigger sync without colliding on USB CDC.
         self.window._on_packet_received(Packet(PacketType.CONFIG_OK, 1, b""))
         self.assertEqual(
             worker.sent,
-            ["CONFIGURE 100000 1000", f"TRIGGER 0 {TriggerMode.NONE}"],
+            [
+                "STOP",
+                "CONFIGURE 100000 1000",
+                f"TRIGGER 0 {TriggerMode.NONE} 0 0",
+            ],
         )
         self.assertFalse(self.window.start_button.isEnabled())
 
@@ -363,14 +379,23 @@ class MainWindowUiTests(unittest.TestCase):
         self.assertTrue(self.window.start_button.isEnabled())
         self.assertEqual(self.window.status_label.text(), "Trigger disabled (NONE)")
 
-        # Apply CH1 RISING, verify active status, then warn if dropdown changes unapplied.
+        # Apply CH1 RISING with 20% pre-trigger and 2s timeout, verify active status.
         self.window.trigger_channel_combo.setCurrentIndex(1)
         self.window.trigger_mode_combo.setCurrentIndex(
             self.window.trigger_mode_combo.findData(TriggerMode.RISING)
         )
+        self.window.trigger_pre_combo.setCurrentIndex(
+            self.window.trigger_pre_combo.findData(20)
+        )
+        self.window.trigger_timeout_combo.setCurrentIndex(
+            self.window.trigger_timeout_combo.findData(2000)
+        )
         self.window._apply_trigger_config()
         self.window._on_packet_received(Packet(PacketType.TRIGGER_OK, 3, b""))
-        self.assertEqual(self.window.status_label.text(), "Trigger active: CH1 Rising")
+        self.assertEqual(
+            self.window.status_label.text(),
+            "Trigger active: CH1 Rising (Pre 20%, Timeout 2s)",
+        )
 
         self.window.trigger_channel_combo.setCurrentIndex(0)
         self.assertIn("Apply trigger", self.window.status_label.text())
@@ -380,7 +405,10 @@ class MainWindowUiTests(unittest.TestCase):
         self.window.device_worker = worker
         self.window._desired_config = None
         self.window._on_connected("COM4")
-        self.assertEqual(worker.sent, [f"TRIGGER 0 {TriggerMode.NONE}"])
+        self.assertEqual(
+            worker.sent,
+            ["STOP", f"TRIGGER 0 {TriggerMode.NONE} 0 0"],
+        )
 
 
 if __name__ == "__main__":

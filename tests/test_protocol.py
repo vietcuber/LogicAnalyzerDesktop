@@ -42,13 +42,13 @@ class PacketParserTests(unittest.TestCase):
         parser = PacketParser()
         packets = parser.feed(
             encode_packet(PacketType.TRIGGER_ARMED, 42)
-            + encode_packet(PacketType.TRIGGER_FIRED, 43)
+            + encode_packet(PacketType.TRIGGER_FIRED, 43, (250).to_bytes(4, "little"))
         )
 
         self.assertEqual(len(packets), 2)
         self.assertEqual(packets[0].packet_type, PacketType.TRIGGER_ARMED)
         self.assertEqual(packets[1].packet_type, PacketType.TRIGGER_FIRED)
-        self.assertEqual(packets[1].payload, b"")
+        self.assertEqual(int.from_bytes(packets[1].payload, "little"), 250)
 
 
 if __name__ == "__main__":
