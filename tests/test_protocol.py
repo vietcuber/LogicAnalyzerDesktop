@@ -38,6 +38,18 @@ class PacketParserTests(unittest.TestCase):
         self.assertEqual(packets[0].packet_type, PacketType.CONFIG_OK)
         self.assertEqual(packets[0].sequence, 3)
 
+    def test_parses_trigger_packets(self):
+        parser = PacketParser()
+        packets = parser.feed(
+            encode_packet(PacketType.TRIGGER_ARMED, 42)
+            + encode_packet(PacketType.TRIGGER_FIRED, 43)
+        )
+
+        self.assertEqual(len(packets), 2)
+        self.assertEqual(packets[0].packet_type, PacketType.TRIGGER_ARMED)
+        self.assertEqual(packets[1].packet_type, PacketType.TRIGGER_FIRED)
+        self.assertEqual(packets[1].payload, b"")
+
 
 if __name__ == "__main__":
     unittest.main()

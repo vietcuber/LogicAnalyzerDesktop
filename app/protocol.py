@@ -9,6 +9,13 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 MAX_DATA_PAYLOAD = 1024
 
 
+class TriggerMode(IntEnum):
+    NONE = 0
+    RISING = 1
+    FALLING = 2
+    EITHER = 3
+
+
 class PacketType(IntEnum):
     STREAM_DATA     = 0x01
     SNAPSHOT_DATA   = 0x02
@@ -16,6 +23,10 @@ class PacketType(IntEnum):
     CAPTURE_STARTED = 0x11
     CAPTURE_DONE    = 0x12
     CAPTURE_STOPPED = 0x13
+    TRIGGER_OK      = 0x20
+    TRIGGER_ARMED   = 0x21
+    TRIGGER_FIRED   = 0x22
+    TRIGGER_TIMEOUT = 0x23
     ERROR           = 0x7F
 
 
@@ -94,6 +105,10 @@ class PacketParser:
             PacketType.CAPTURE_STARTED: 0,
             PacketType.CAPTURE_DONE: 4,
             PacketType.CAPTURE_STOPPED: 4,
+            PacketType.TRIGGER_OK: 0,
+            PacketType.TRIGGER_ARMED: 0,
+            PacketType.TRIGGER_FIRED: 0,
+            PacketType.TRIGGER_TIMEOUT: 0,
             PacketType.ERROR: 1,
         }
         return length == expected_lengths[packet_type]

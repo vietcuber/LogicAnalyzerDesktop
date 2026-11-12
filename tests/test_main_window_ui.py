@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.capture_file import load_capture, save_capture
 from app.main_window import BUTTON_WIDTH, MainWindow, SELECTOR_WIDTH
+from app.protocol import Packet, PacketType, TriggerMode
 
 
 class MainWindowUiTests(unittest.TestCase):
@@ -242,6 +243,144 @@ class MainWindowUiTests(unittest.TestCase):
         self.window._apply_channel_layout(capture.channel_layout)
 
         self.assertEqual(self.window._get_channel_layout(), expected_layout)
+
+    def _make_dummy_worker(self):
+        return type(
+            "DummyWorker",
+            (),
+            {
+                "sent": [],
+                "start_capture": lambda _self: _self.sent.append("START"),
+                "stop_capture": lambda _self: _self.sent.append("STOP"),
+                "trigger": lambda _self, ch, mode: _self.sent.append(f"TRIGGER {ch} {mode}"),
+                "configure": lambda _self, f, s: _self.sent.append(f"CONFIGURE {f} {s}"),
+                "request_stop": lambda _self: None,
+                "wait": lambda _self, *_args, **_kwargs: None,
+            },
+        )()
+
+    def test_triggered_capture_accepts_data_after_trigger_fired(self):
+        self.window._is_connected = True
+        self.window.device_worker = self._make_dummy_worker()
+        self.window._desired_config = (100_000, 1000)
+        self.window._pending_config = (100_000, 1000)
+        self.window._on_packet_received(Packet(PacketType.CONFIG_OK, 0, b""))
+        self.window._on_packet_received(Packet(PacketType.TRIGGER_OK, 1, b""))
+
+        self.window._start_capture()
+        self.window._on_packet_received(Packet(PacketType.TRIGGER_ARMED, 2, b""))
+        self.assertTrue(self.window._trigger_armed)
+        self.assertFalse(self.window._capture_active)
+        self.assertTrue(self.window.stop_button.isEnabled())
+        self.assertFalse(self.window.frequency_combo.isEnabled())
+
+        self.window._on_packet_received(Packet(PacketType.TRIGGER_FIRED, 3, b""))
+        self.assertFalse(self.window._trigger_armed)
+        self.assertTrue(self.window._capture_active)
+        self.assertTrue(self.window._plot_timer.isActive())
+
+        self.window._on_packet_received(Packet(PacketType.STREAM_DATA, 4, bytes([0x55] * 1000)))
+        self.assertEqual(len(self.window._capture_samples), 1000)
+
+        self.window._on_packet_received(
+            Packet(PacketType.CAPTURE_DONE, 5, (1000).to_bytes(4, "little"))
+        )
+        self.assertFalse(self.window._capture_active)
+        self.assertEqual(self.window.status_label.text(), "Complete: 1,000 samples received")
+        self.assertTrue(self.window.save_button.isEnabled())
+        self.assertTrue(self.window.apply_trigger_button.isEnabled())
+
+    def test_stop_while_trigger_armed_sends_stop_and_accepts_zero_samples(self):
+        worker = self._make_dummy_worker()
+        self.window._is_connected = True
+        self.window.device_worker = worker
+        self.window._desired_config = (100_000, 1000)
+        self.window._pending_config = (100_000, 1000)
+        self.window._on_packet_received(Packet(PacketType.CONFIG_OK, 0, b""))
+
+        self.window._start_capture()
+        self.window._on_packet_received(Packet(PacketType.TRIGGER_ARMED, 1, b""))
+        self.window._stop_capture()
+
+        self.assertEqual(worker.sent, ["START", "STOP"])
+
+        self.window._on_packet_received(
+            Packet(PacketType.CAPTURE_STOPPED, 2, (0).to_bytes(4, "little"))
+        )
+        self.assertFalse(self.window._trigger_armed)
+        self.assertFalse(self.window._capture_active)
+        self.assertFalse(self.window.stop_button.isEnabled())
+        self.assertTrue(self.window.start_button.isEnabled())
+        self.assertTrue(self.window.apply_trigger_button.isEnabled())
+        self.assertFalse(self.window.save_button.isEnabled())
+        self.assertEqual(self.window.status_label.text(), "Stopped before trigger: 0 samples")
+
+    def test_trigger_timeout_and_error_packet_reenable_controls(self):
+        self.window._is_connected = True
+        self.window.device_worker = self._make_dummy_worker()
+        self.window._desired_config = (100_000, 1000)
+        self.window._pending_config = (100_000, 1000)
+        self.window._on_packet_received(Packet(PacketType.CONFIG_OK, 0, b""))
+
+        self.window._start_capture()
+        self.window._on_packet_received(Packet(PacketType.TRIGGER_ARMED, 1, b""))
+        self.window._on_packet_received(Packet(PacketType.TRIGGER_TIMEOUT, 2, b""))
+        self.assertFalse(self.window._trigger_armed)
+        self.assertFalse(self.window.stop_button.isEnabled())
+        self.assertTrue(self.window.start_button.isEnabled())
+        self.assertTrue(self.window.apply_trigger_button.isEnabled())
+
+        self.window._start_capture()
+        self.window._on_packet_received(Packet(PacketType.ERROR, 3, bytes([0x04])))
+        self.assertFalse(self.window._capture_active)
+        self.assertFalse(self.window._trigger_armed)
+        self.assertFalse(self.window.stop_button.isEnabled())
+        self.assertFalse(self.window._start_timeout_timer.isActive())
+        self.assertTrue(self.window.apply_trigger_button.isEnabled())
+        self.assertTrue(self.window.frequency_combo.isEnabled())
+
+    def test_connect_syncs_trigger_after_config_and_tracks_active_status(self):
+        worker = self._make_dummy_worker()
+        self.window.device_worker = worker
+        f_idx = self.window.frequency_combo.findData(100_000)
+        s_idx = self.window.samples_combo.findData(1000)
+        self.window.frequency_combo.setCurrentIndex(f_idx)
+        self.window.samples_combo.setCurrentIndex(s_idx)
+
+        self.window._on_connected("COM4")
+        self.assertEqual(worker.sent, ["CONFIGURE 100000 1000"])
+        self.assertFalse(self.window.start_button.isEnabled())
+
+        # CONFIG_OK triggers automatic UI trigger sync without colliding on USB CDC.
+        self.window._on_packet_received(Packet(PacketType.CONFIG_OK, 1, b""))
+        self.assertEqual(
+            worker.sent,
+            ["CONFIGURE 100000 1000", f"TRIGGER 0 {TriggerMode.NONE}"],
+        )
+        self.assertFalse(self.window.start_button.isEnabled())
+
+        self.window._on_packet_received(Packet(PacketType.TRIGGER_OK, 2, b""))
+        self.assertTrue(self.window.start_button.isEnabled())
+        self.assertEqual(self.window.status_label.text(), "Trigger disabled (NONE)")
+
+        # Apply CH1 RISING, verify active status, then warn if dropdown changes unapplied.
+        self.window.trigger_channel_combo.setCurrentIndex(1)
+        self.window.trigger_mode_combo.setCurrentIndex(
+            self.window.trigger_mode_combo.findData(TriggerMode.RISING)
+        )
+        self.window._apply_trigger_config()
+        self.window._on_packet_received(Packet(PacketType.TRIGGER_OK, 3, b""))
+        self.assertEqual(self.window.status_label.text(), "Trigger active: CH1 Rising")
+
+        self.window.trigger_channel_combo.setCurrentIndex(0)
+        self.assertIn("Apply trigger", self.window.status_label.text())
+
+    def test_connect_without_selected_config_immediately_syncs_trigger(self):
+        worker = self._make_dummy_worker()
+        self.window.device_worker = worker
+        self.window._desired_config = None
+        self.window._on_connected("COM4")
+        self.assertEqual(worker.sent, [f"TRIGGER 0 {TriggerMode.NONE}"])
 
 
 if __name__ == "__main__":

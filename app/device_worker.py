@@ -4,7 +4,7 @@ from threading import Event
 from PySide6.QtCore import QThread, Signal
 import serial
 
-from .protocol import Packet, PacketParser
+from .protocol import Packet, PacketParser, TriggerMode
 
 
 class DeviceWorker(QThread):
@@ -28,6 +28,10 @@ class DeviceWorker(QThread):
 
     def stop_capture(self) -> None:
         self._commands.put(b"STOP")
+
+    def trigger(self, channel: int, mode: TriggerMode) -> None:
+        mode_name = mode.name.upper()
+        self._commands.put(f"TRIGGER {channel} {mode_name}".encode("ascii"))
 
     def request_stop(self) -> None:
         self._stop_requested.set()

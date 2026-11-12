@@ -30,7 +30,7 @@ from .capture_file import (
     load_capture,
     save_capture,
 )
-from .protocol import Packet, PacketType
+from .protocol import Packet, PacketType, TriggerMode
 from .waveform import find_channel_edges, format_time
 
 
@@ -184,6 +184,9 @@ class MainWindow(QMainWindow):
         capture_row = self._make_capture_row()
         capture_row.setAlignment(Qt.AlignmentFlag.AlignLeft)
         layout.addLayout(capture_row)
+        trigger_row = self._make_trigger_row()
+        trigger_row.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addLayout(trigger_row)
         layout.addLayout(self._make_action_row())
         layout.addLayout(self._make_test_row())
         layout.addWidget(self._make_marker_row())
@@ -213,8 +216,14 @@ class MainWindow(QMainWindow):
         self._configured_config: tuple[int, int] | None = None
         self._worker_error_message: str | None = None
         self._capture_active = False
+        self._trigger_armed = False
         self._capture_samples = bytearray()
         self._capture_frequency_hz: int | None = None
+        self._trigger_config_ready = False
+        self._trigger_config_pending = False
+        self._pending_trigger: tuple[int, TriggerMode] | None = None
+        self._applied_trigger: tuple[int, TriggerMode] | None = None
+        self._sync_trigger_on_connect = False
         self._capture_metadata_available = False
         self._plot_window_samples = 4096
         self._marker_channel = 0
@@ -224,6 +233,9 @@ class MainWindow(QMainWindow):
         self._config_timeout_timer = QTimer(self)
         self._config_timeout_timer.setSingleShot(True)
         self._config_timeout_timer.timeout.connect(self._on_config_timeout)
+        self._start_timeout_timer = QTimer(self)
+        self._start_timeout_timer.setSingleShot(True)
+        self._start_timeout_timer.timeout.connect(self._on_start_timeout)
         self._plot_timer = QTimer(self)
         self._plot_timer.setInterval(250)
         self._plot_timer.timeout.connect(self._refresh_capture_plot)
@@ -262,6 +274,13 @@ class MainWindow(QMainWindow):
         )
         self.start_button.setEnabled(False)
         self.start_button.clicked.connect(self._start_capture)
+        self.trigger_channel_combo.currentIndexChanged.connect(
+            self._on_trigger_selection_changed
+        )
+        self.trigger_mode_combo.currentIndexChanged.connect(
+            self._on_trigger_selection_changed
+        )
+        self.apply_trigger_button.clicked.connect(self._apply_trigger_config)
         self.stop_button.clicked.connect(self._stop_capture)
         self.stop_button.setEnabled(False)
         self.save_button.clicked.connect(self._save_capture)
@@ -296,6 +315,7 @@ class MainWindow(QMainWindow):
         self.cursor_button.setEnabled(False)
         self.markers_button.setEnabled(False)
         self.clear_button.setEnabled(False)
+        self.apply_trigger_button.setEnabled(False)
         self._refresh_ports()
 
     def _show_information(self):
@@ -352,6 +372,32 @@ class MainWindow(QMainWindow):
         row.addWidget(self.frequency_combo)
         row.addSpacing(12)
         row.addWidget(self.samples_combo)
+        return row
+
+    def _make_trigger_row(self):
+        row = QHBoxLayout()
+
+        self.trigger_channel_combo = QComboBox()
+        self.trigger_channel_combo.setFixedWidth(SELECTOR_WIDTH)
+        for channel in range(8):
+            self.trigger_channel_combo.addItem(f"CH{channel}", channel)
+
+        self.trigger_mode_combo = QComboBox()
+        self.trigger_mode_combo.setFixedWidth(SELECTOR_WIDTH)
+        self.trigger_mode_combo.addItem("Trigger: NONE", TriggerMode.NONE)
+        self.trigger_mode_combo.addItem("Trigger: RISING", TriggerMode.RISING)
+        self.trigger_mode_combo.addItem("Trigger: FALLING", TriggerMode.FALLING)
+        self.trigger_mode_combo.addItem("Trigger: EITHER", TriggerMode.EITHER)
+        self.trigger_mode_combo.setCurrentIndex(0)
+
+        self.apply_trigger_button = QPushButton("Apply trigger")
+        self.apply_trigger_button.setFixedWidth(BUTTON_WIDTH)
+
+        row.addWidget(self.trigger_channel_combo)
+        row.addSpacing(12)
+        row.addWidget(self.trigger_mode_combo)
+        row.addSpacing(12)
+        row.addWidget(self.apply_trigger_button)
         return row
 
     def _make_action_row(self):
@@ -619,7 +665,7 @@ class MainWindow(QMainWindow):
         self._on_configuration_changed()
 
     def _on_configuration_changed(self, _index=None):
-        if self._capture_active:
+        if self._capture_active or self._trigger_armed:
             return
 
         frequency = self.frequency_combo.currentData()
@@ -659,7 +705,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_connection(self):
         if self.device_worker is not None:
-            if self._capture_active:
+            if self._capture_active or self._trigger_armed:
                 self.status_label.setText(
                     "Capture active; wait for completion before disconnecting"
                 )
@@ -689,26 +735,64 @@ class MainWindow(QMainWindow):
 
     def _on_connected(self, port_name):
         self._is_connected = True
+        self._trigger_config_pending = False
+        self._trigger_config_ready = False
+        self._pending_trigger = None
+        self._applied_trigger = None
         self.port_combo.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.frequency_combo.setEnabled(True)
         self.samples_combo.setEnabled(True)
+        self.trigger_channel_combo.setEnabled(True)
+        self.trigger_mode_combo.setEnabled(True)
         self.connect_button.setText("Disconnect")
         self.connect_button.setEnabled(True)
+        self.apply_trigger_button.setEnabled(True)
         self.status_label.setText(f"Connected to {port_name}")
-        self._send_configuration_if_ready()
+        if self._desired_config is not None:
+            # Sync trigger after initial CONFIG_OK so commands never collide on USB CDC.
+            self._sync_trigger_on_connect = True
+            self._send_configuration_if_ready()
+        else:
+            self._sync_trigger_on_connect = False
+            self._sync_ui_trigger_to_device()
+
+    def _on_start_timeout(self):
+        if self._capture_active or self._trigger_armed:
+            return
+        self.start_button.setEnabled(
+            self._is_connected
+            and self._desired_config is not None
+            and self._configured_config == self._desired_config
+        )
+        self.stop_button.setEnabled(False)
+        self.apply_trigger_button.setEnabled(self._is_connected)
+        self.status_label.setText(
+            "Start timed out: device did not respond in time"
+        )
 
     def _on_disconnected(self):
         self._is_connected = False
         self._capture_active = False
+        self._trigger_armed = False
+        self._trigger_config_pending = False
+        self._trigger_config_ready = False
+        self._pending_trigger = None
+        self._applied_trigger = None
+        self._sync_trigger_on_connect = False
         self.stop_button.setEnabled(False)
         self._plot_timer.stop()
         self._config_timeout_timer.stop()
+        self._start_timeout_timer.stop()
         self._pending_config = None
         self._configured_config = None
         self.frequency_combo.setEnabled(True)
         self.samples_combo.setEnabled(True)
+        self.trigger_channel_combo.setEnabled(True)
+        self.trigger_mode_combo.setEnabled(True)
+        self.open_button.setEnabled(True)
         self.start_button.setEnabled(False)
+        self.apply_trigger_button.setEnabled(False)
         self.port_combo.setEnabled(True)
         self.refresh_button.setEnabled(True)
         self.connect_button.setText("Connect")
@@ -744,31 +828,23 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(
                     f"Configured: {frequency:,} Hz / {sample_count:,} samples"
                 )
-                self.start_button.setEnabled(self._is_connected)
+                if self._sync_trigger_on_connect:
+                    self._sync_trigger_on_connect = False
+                    self._sync_ui_trigger_to_device()
+                else:
+                    self.start_button.setEnabled(
+                        self._is_connected
+                        and not self._trigger_config_pending
+                        and not self._capture_active
+                        and not self._trigger_armed
+                    )
             else:
                 self._send_configuration_if_ready()
             return
 
         if packet.packet_type == PacketType.CAPTURE_STARTED:
-            if self._desired_config is None:
-                self.status_label.setText(
-                    "Received CAPTURE_STARTED without a selected configuration"
-                )
-                return
-
-            self._capture_samples.clear()
-            self._marker_edges_cache_key = None
-            self._capture_frequency_hz = self._desired_config[0]
-            self.time_axis.set_frequency(self._capture_frequency_hz)
-            self._capture_active = True
-            self.frequency_combo.setEnabled(False)
-            self.samples_combo.setEnabled(False)
-            self.connect_button.setEnabled(False)
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-            self.progress.setValue(0)
-            self.status_label.setText("Capturing: 0 samples received")
-            self._plot_timer.start()
+            self._start_timeout_timer.stop()
+            self._begin_active_capture("Capturing: 0 samples received")
             return
 
         if packet.packet_type in (
@@ -786,6 +862,62 @@ class MainWindow(QMainWindow):
             self._handle_capture_stopped(packet)
             return
 
+        if packet.packet_type in (
+            PacketType.TRIGGER_OK,
+            PacketType.TRIGGER_ARMED,
+            PacketType.TRIGGER_FIRED,
+            PacketType.TRIGGER_TIMEOUT,
+        ):
+            trigger_status = {
+                PacketType.TRIGGER_OK: "Trigger configured",
+                PacketType.TRIGGER_ARMED: "Trigger armed, waiting edge",
+                PacketType.TRIGGER_FIRED: "Trigger fired, capture started",
+                PacketType.TRIGGER_TIMEOUT: "Trigger timeout",
+            }
+            if packet.packet_type == PacketType.TRIGGER_OK:
+                self._trigger_config_pending = False
+                self._trigger_config_ready = True
+                if self._pending_trigger is not None:
+                    self._applied_trigger = self._pending_trigger
+                    self._pending_trigger = None
+                if (
+                    self._configured_config is not None
+                    and self._configured_config == self._desired_config
+                    and not self._capture_active
+                    and not self._trigger_armed
+                ):
+                    self.start_button.setEnabled(self._is_connected)
+                if self._applied_trigger is not None:
+                    ch, mode = self._applied_trigger
+                    if mode == TriggerMode.NONE:
+                        self.status_label.setText("Trigger disabled (NONE)")
+                    else:
+                        self.status_label.setText(
+                            f"Trigger active: CH{ch} {mode.name.title()}"
+                        )
+                else:
+                    self.status_label.setText(trigger_status[packet.packet_type])
+                return
+            if packet.packet_type == PacketType.TRIGGER_ARMED:
+                self._start_timeout_timer.stop()
+                self._trigger_armed = True
+                self._set_capture_controls_enabled(False)
+                self.stop_button.setEnabled(True)
+                self.status_label.setText(trigger_status[packet.packet_type])
+                return
+            if packet.packet_type == PacketType.TRIGGER_FIRED:
+                self._start_timeout_timer.stop()
+                self._begin_active_capture(trigger_status[packet.packet_type])
+                return
+
+            self._start_timeout_timer.stop()
+            self._trigger_armed = False
+            self._trigger_config_pending = False
+            self.stop_button.setEnabled(False)
+            self._set_capture_controls_enabled(True)
+            self.status_label.setText(trigger_status[packet.packet_type])
+            return
+
         if packet.packet_type == PacketType.ERROR:
             error_names = {
                 0x01: "Device is not configured",
@@ -797,18 +929,99 @@ class MainWindow(QMainWindow):
             }
             error_code = packet.payload[0]
             self._config_timeout_timer.stop()
+            self._start_timeout_timer.stop()
             self._pending_config = None
             self._configured_config = None
+            self._trigger_config_pending = False
+            self._trigger_config_ready = False
+            self._pending_trigger = None
+            self._applied_trigger = None
+            self._sync_trigger_on_connect = False
+            self._trigger_armed = False
             self._capture_active = False
+            self.stop_button.setEnabled(False)
             self._plot_timer.stop()
-            self.frequency_combo.setEnabled(True)
-            self.samples_combo.setEnabled(True)
-            self.connect_button.setEnabled(self._is_connected)
+            self._set_capture_controls_enabled(True)
             self.start_button.setEnabled(False)
             self.status_label.setText(
                 f"Device error 0x{error_code:02X}: "
                 f"{error_names.get(error_code, 'Unknown error')}"
             )
+
+    def set_trigger_mode(self, channel: int, mode: TriggerMode) -> None:
+        if self.device_worker is None:
+            return
+        if isinstance(mode, int) and not isinstance(mode, TriggerMode):
+            mode = TriggerMode(mode)
+        self.device_worker.trigger(channel, mode)
+
+    def _on_trigger_selection_changed(self, _index=None):
+        if not self._is_connected or self._capture_active or self._trigger_armed:
+            return
+        channel = self.trigger_channel_combo.currentData()
+        mode = self.trigger_mode_combo.currentData()
+        if channel is None or mode is None:
+            return
+        selection = (int(channel), TriggerMode(mode))
+        if self._applied_trigger is not None and selection != self._applied_trigger:
+            self.status_label.setText(
+                "Trigger selection changed - click 'Apply trigger' to update device"
+            )
+
+    def _send_trigger_selection(self, channel: int, mode: TriggerMode, status_prefix: str = "Trigger set"):
+        self._trigger_config_pending = True
+        self._trigger_config_ready = False
+        self._pending_trigger = (channel, mode)
+        self.start_button.setEnabled(False)
+        self.set_trigger_mode(channel, mode)
+        self.status_label.setText(
+            f"{status_prefix}: CH{channel} {mode.name.title()} (waiting for ack...)"
+        )
+
+    def _sync_ui_trigger_to_device(self):
+        if self.device_worker is None or not self._is_connected:
+            return
+        channel = self.trigger_channel_combo.currentData()
+        mode = self.trigger_mode_combo.currentData()
+        if channel is None or mode is None:
+            return
+        self._send_trigger_selection(int(channel), TriggerMode(mode), "Syncing trigger")
+
+    def _apply_trigger_config(self):
+        if self.device_worker is None or not self._is_connected:
+            self.status_label.setText("Connect to the STM32 device before setting trigger")
+            return
+
+        if self._capture_active or self._trigger_armed:
+            self.status_label.setText("Stop the current capture before changing trigger settings")
+            return
+
+        channel = self.trigger_channel_combo.currentData()
+        mode = self.trigger_mode_combo.currentData()
+        if channel is None or mode is None:
+            self.status_label.setText("Select both trigger channel and trigger mode")
+            return
+
+        self._send_trigger_selection(int(channel), TriggerMode(mode))
+
+    def _begin_active_capture(self, status_text: str):
+        if self._desired_config is None:
+            self.status_label.setText(
+                "Received capture start without a selected configuration"
+            )
+            return
+
+        self._capture_samples.clear()
+        self._marker_edges_cache_key = None
+        self._capture_frequency_hz = self._desired_config[0]
+        self.time_axis.set_frequency(self._capture_frequency_hz)
+        self._trigger_armed = False
+        self._capture_active = True
+        self._set_capture_controls_enabled(False)
+        self.stop_button.setEnabled(True)
+        self.progress.setValue(0)
+        self.status_label.setText(status_text)
+        self._plot_timer.start()
 
     def _start_capture(self):
         if (
@@ -817,7 +1030,12 @@ class MainWindow(QMainWindow):
             or self._configured_config is None
             or self._configured_config != self._desired_config
             or self._capture_active
+            or self._trigger_armed
         ):
+            return
+
+        if self._trigger_config_pending and not self._trigger_config_ready:
+            self.status_label.setText("Waiting for trigger configuration ACK before starting")
             return
 
         self._capture_samples.clear()
@@ -841,14 +1059,16 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.status_label.setText("Starting capture...")
         self.start_button.setEnabled(False)
+        self.apply_trigger_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self._start_timeout_timer.start(3000)
         self.device_worker.start_capture()
 
     def _stop_capture(self):
         if (
             not self._is_connected
             or self.device_worker is None
-            or not self._capture_active
+            or (not self._capture_active and not self._trigger_armed)
         ):
             return
 
@@ -890,68 +1110,15 @@ class MainWindow(QMainWindow):
         self.progress.setValue(progress)
 
     def _handle_capture_done(self, packet: Packet):
-        if self._desired_config is None:
-            self.status_label.setText("Unexpected CAPTURE_DONE packet")
-            return
-
-        reported_samples = int.from_bytes(packet.payload, byteorder="little")
-        received_samples = len(self._capture_samples)
-        _, target_samples = self._desired_config
-
-        self._capture_active = False
-        self.stop_button.setEnabled(False)
-        self._plot_timer.stop()
-        self._set_capture_controls_enabled(True)
-        self._refresh_capture_plot(show_all=True)
-
-        valid_partial_capture = (
-            0 < reported_samples <= target_samples
-            and received_samples == reported_samples
-        )
-
-        if not valid_partial_capture:
-            self.start_button.setEnabled(
-                self._is_connected
-                and self._desired_config is not None
-                and self._configured_config == self._desired_config
-            )
-            self.clear_button.setEnabled(bool(self._capture_samples))
-            self.cursor_button.setEnabled(bool(self._capture_samples))
-            self.markers_button.setEnabled(bool(self._capture_samples))
-            self.save_button.setEnabled(bool(self._capture_samples))
-            self.status_label.setText(
-                "Capture count mismatch: "
-                f"received {received_samples:,}/{target_samples:,}, "
-                f"device reported {reported_samples:,}"
-            )
-            return
-
-        percent = int((received_samples * 100) / max(target_samples, 1))
-        self.progress.setValue(percent)
-        self._capture_frequency_hz = self._desired_config[0]
-        self.time_axis.set_frequency(self._capture_frequency_hz)
-        self._capture_metadata_available = True
-        self.save_button.setEnabled(True)
-        self.clear_button.setEnabled(True)
-        self.cursor_button.setEnabled(bool(self._capture_samples))
-        self.markers_button.setEnabled(bool(self._capture_samples))
-        if received_samples < target_samples:
-            self.status_label.setText(
-                f"Stopped early: {received_samples:,}/{target_samples:,} samples saved"
-            )
-        else:
-            self.status_label.setText(
-                f"Complete: {received_samples:,} samples received"
-            )
-        self.start_button.setEnabled(
-            self._is_connected
-            and self._desired_config is not None
-            and self._configured_config == self._desired_config
-        )
+        self._finish_capture(packet, is_stopped=False)
 
     def _handle_capture_stopped(self, packet: Packet):
+        self._finish_capture(packet, is_stopped=True)
+
+    def _finish_capture(self, packet: Packet, is_stopped: bool):
         if self._desired_config is None:
-            self.status_label.setText("Unexpected CAPTURE_STOPPED packet")
+            packet_name = "CAPTURE_STOPPED" if is_stopped else "CAPTURE_DONE"
+            self.status_label.setText(f"Unexpected {packet_name} packet")
             return
 
         reported_samples = int.from_bytes(packet.payload, byteorder="little")
@@ -959,45 +1126,66 @@ class MainWindow(QMainWindow):
         _, target_samples = self._desired_config
 
         self._capture_active = False
+        self._trigger_armed = False
         self.stop_button.setEnabled(False)
         self._plot_timer.stop()
         self._set_capture_controls_enabled(True)
         self._refresh_capture_plot(show_all=True)
 
+        min_samples = 0 if is_stopped else 1
         valid_partial_capture = (
-            0 < reported_samples <= target_samples
+            min_samples <= reported_samples <= target_samples
             and received_samples == reported_samples
         )
 
+        has_samples = bool(self._capture_samples)
         if not valid_partial_capture:
-            self.status_label.setText(
-                "Stopped capture but sample count is inconsistent: "
-                f"received {received_samples:,}/{target_samples:,}, "
-                f"device reported {reported_samples:,}"
-            )
             self.start_button.setEnabled(
                 self._is_connected
                 and self._desired_config is not None
                 and self._configured_config == self._desired_config
             )
-            self.clear_button.setEnabled(bool(self._capture_samples))
-            self.cursor_button.setEnabled(bool(self._capture_samples))
-            self.markers_button.setEnabled(bool(self._capture_samples))
-            self.save_button.setEnabled(bool(self._capture_samples))
+            self.clear_button.setEnabled(has_samples)
+            self.cursor_button.setEnabled(has_samples)
+            self.markers_button.setEnabled(has_samples)
+            self.save_button.setEnabled(has_samples)
+            prefix = (
+                "Stopped capture but sample count is inconsistent: "
+                if is_stopped
+                else "Capture count mismatch: "
+            )
+            self.status_label.setText(
+                f"{prefix}received {received_samples:,}/{target_samples:,}, "
+                f"device reported {reported_samples:,}"
+            )
             return
 
         percent = int((received_samples * 100) / max(target_samples, 1))
         self.progress.setValue(percent)
-        self._capture_frequency_hz = self._desired_config[0]
-        self.time_axis.set_frequency(self._capture_frequency_hz)
-        self._capture_metadata_available = True
-        self.save_button.setEnabled(True)
-        self.clear_button.setEnabled(True)
-        self.cursor_button.setEnabled(bool(self._capture_samples))
-        self.markers_button.setEnabled(bool(self._capture_samples))
-        self.status_label.setText(
-            f"Stopped early: {received_samples:,}/{target_samples:,} samples saved"
-        )
+        if received_samples == 0:
+            self._capture_frequency_hz = None
+            self._capture_metadata_available = False
+            self.save_button.setEnabled(False)
+            self.clear_button.setEnabled(False)
+            self.cursor_button.setEnabled(False)
+            self.markers_button.setEnabled(False)
+            self.status_label.setText("Stopped before trigger: 0 samples")
+        else:
+            self._capture_frequency_hz = self._desired_config[0]
+            self.time_axis.set_frequency(self._capture_frequency_hz)
+            self._capture_metadata_available = True
+            self.save_button.setEnabled(True)
+            self.clear_button.setEnabled(True)
+            self.cursor_button.setEnabled(True)
+            self.markers_button.setEnabled(True)
+            if is_stopped or received_samples < target_samples:
+                self.status_label.setText(
+                    f"Stopped early: {received_samples:,}/{target_samples:,} samples saved"
+                )
+            else:
+                self.status_label.setText(
+                    f"Complete: {received_samples:,} samples received"
+                )
         self.start_button.setEnabled(
             self._is_connected
             and self._desired_config is not None
@@ -1006,6 +1194,7 @@ class MainWindow(QMainWindow):
 
     def _fail_capture(self, message: str):
         self._capture_active = False
+        self._trigger_armed = False
         self.stop_button.setEnabled(False)
         self._plot_timer.stop()
         self._set_capture_controls_enabled(True)
@@ -1018,16 +1207,21 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Capture failed: {message}")
 
     def _set_capture_controls_enabled(self, enabled: bool):
+        busy = self._capture_active or self._trigger_armed
         self.frequency_combo.setEnabled(enabled)
         self.samples_combo.setEnabled(enabled)
+        self.trigger_channel_combo.setEnabled(enabled)
+        self.trigger_mode_combo.setEnabled(enabled)
         self.connect_button.setEnabled(enabled and self._is_connected)
+        self.apply_trigger_button.setEnabled(enabled and self._is_connected and not busy)
         self.open_button.setEnabled(enabled)
         self.start_button.setEnabled(
             enabled
             and self._is_connected
             and self._desired_config is not None
             and self._configured_config == self._desired_config
-            and not self._capture_active
+            and not busy
+            and not self._trigger_config_pending
         )
 
     def _refresh_capture_plot(self, show_all: bool = False):
